@@ -79,8 +79,7 @@ type Program struct {
 	// treated as bits. These options can be set via various ProgramOptions.
 	startupOptions startupOptions
 
-	mtx  *sync.Mutex
-	done chan struct{}
+	mtx *sync.Mutex
 
 	msgs chan Msg
 
@@ -251,32 +250,34 @@ func NewProgram(model Model, opts ...ProgramOption) *Program {
 // Start initializes the program.
 func (p *Program) Start() error {
 	p.msgs = make(chan Msg)
-	p.done = make(chan struct{})
 
 	var (
 		cmds = make(chan Cmd)
 		errs = make(chan error)
 	)
 
+	// channels for managing goroutine lifecycles
 	var (
 		readLoopDone   = make(chan struct{}, 1)
 		sigintLoopDone = make(chan struct{}, 1)
 		cmdLoopDone    = make(chan struct{}, 1)
 		resizeLoopDone = make(chan struct{}, 1)
+		initSignalDone = make(chan struct{}, 1)
 
-		waitForLoops = func(withReadLoop bool) {
+		waitForGoroutines = func(withReadLoop bool) {
 			if withReadLoop {
 				<-readLoopDone
 			}
 			<-cmdLoopDone
 			<-resizeLoopDone
 			<-sigintLoopDone
+			<-initSignalDone
 		}
 	)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancelInputRead := context.WithCancel(context.Background())
 	defer func() {
-		cancel()
+		cancelInputRead()
 	}()
 
 	switch {
@@ -314,11 +315,12 @@ func (p *Program) Start() error {
 	// that keystroke and send it along to Program.Update. If input is not a
 	// TTY, however, ^C will be caught here.
 	go func() {
-		defer func() { sigintLoopDone <- struct{}{} }()
-
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT)
-		defer signal.Stop(sig)
+		defer func() {
+			signal.Stop(sig)
+			close(sigintLoopDone)
+		}()
 
 		select {
 		case <-ctx.Done():
@@ -371,7 +373,11 @@ func (p *Program) Start() error {
 	initCmd := model.Init()
 	if initCmd != nil {
 		go func() {
-			cmds <- initCmd
+			defer close(initSignalDone)
+			select {
+			case cmds <- initCmd:
+			case <-ctx.Done():
+			}
 		}()
 	}
 
@@ -385,9 +391,7 @@ func (p *Program) Start() error {
 	// Subscribe to user input
 	if p.input != nil {
 		go func() {
-			defer func() {
-				readLoopDone <- struct{}{}
-			}()
+			defer close(readLoopDone)
 
 			for {
 				if ctx.Err() != nil {
@@ -396,8 +400,8 @@ func (p *Program) Start() error {
 
 				msg, err := readInput(p.input)
 				if err != nil {
-					// If we get EOF just stop listening for input
-					if errors.Is(err, io.EOF) || errors.Is(err, errAborted) {
+					// If we get EOF or the read is cancelled just stop listening for input
+					if errors.Is(err, io.EOF) || errors.Is(err, errCanceled) {
 						return
 					}
 
@@ -429,13 +433,11 @@ func (p *Program) Start() error {
 
 	// Process commands
 	go func() {
-		defer func() { cmdLoopDone <- struct{}{} }()
+		defer close(cmdLoopDone)
 
 		for {
 			select {
 			case <-ctx.Done():
-				return
-			case <-p.done:
 				return
 			case cmd := <-cmds:
 				if cmd != nil {
@@ -451,8 +453,8 @@ func (p *Program) Start() error {
 	for {
 		select {
 		case err := <-errs:
-			cancel()
-			waitForLoops(cancelRead())
+			cancelInputRead()
+			waitForGoroutines(cancelRead())
 			p.shutdown(false)
 
 			return err
@@ -461,8 +463,8 @@ func (p *Program) Start() error {
 			// Handle special internal messages
 			switch msg := msg.(type) {
 			case quitMsg:
-				cancel()
-				waitForLoops(cancelRead())
+				cancelInputRead()
+				waitForGoroutines(cancelRead())
 				p.shutdown(false)
 				return nil
 
@@ -531,7 +533,6 @@ func (p *Program) shutdown(kill bool) {
 	} else {
 		p.renderer.stop()
 	}
-	close(p.done)
 	p.ExitAltScreen()
 	p.DisableMouseCellMotion()
 	p.DisableMouseAllMotion()
