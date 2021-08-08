@@ -19,6 +19,7 @@ import (
 	"runtime/debug"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/containerd/console"
 	isatty "github.com/mattn/go-isatty"
@@ -266,7 +267,11 @@ func (p *Program) Start() error {
 
 		waitForGoroutines = func(withReadLoop bool) {
 			if withReadLoop {
-				<-readLoopDone
+				select {
+				case <-readLoopDone:
+				case <-time.After(1 * time.Second):
+					panic("read loop hangs")
+				}
 			}
 			<-cmdLoopDone
 			<-resizeLoopDone
@@ -275,9 +280,9 @@ func (p *Program) Start() error {
 		}
 	)
 
-	ctx, cancelInputRead := context.WithCancel(context.Background())
+	ctx, cancelContext := context.WithCancel(context.Background())
 	defer func() {
-		cancelInputRead()
+		cancelContext()
 	}()
 
 	switch {
@@ -453,7 +458,7 @@ func (p *Program) Start() error {
 	for {
 		select {
 		case err := <-errs:
-			cancelInputRead()
+			cancelContext()
 			waitForGoroutines(cancelReader.Cancel())
 			p.shutdown(false)
 
@@ -463,7 +468,7 @@ func (p *Program) Start() error {
 			// Handle special internal messages
 			switch msg := msg.(type) {
 			case quitMsg:
-				cancelInputRead()
+				cancelContext()
 				waitForGoroutines(cancelReader.Cancel())
 				p.shutdown(false)
 				return nil
