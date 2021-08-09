@@ -384,6 +384,8 @@ func (p *Program) Start() error {
 			case <-ctx.Done():
 			}
 		}()
+	} else {
+		close(initSignalDone)
 	}
 
 	// Start renderer
@@ -415,6 +417,8 @@ func (p *Program) Start() error {
 				p.msgs <- msg
 			}
 		}()
+	} else {
+		defer close(readLoopDone)
 	}
 
 	if f, ok := p.output.(*os.File); ok {
@@ -433,6 +437,8 @@ func (p *Program) Start() error {
 
 		// Listen for window resizes
 		go listenForResize(ctx, f, p.msgs, errs, resizeLoopDone)
+	} else {
+		close(resizeLoopDone)
 	}
 
 	// Process commands
